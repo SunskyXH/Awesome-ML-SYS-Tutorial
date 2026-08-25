@@ -1,16 +1,16 @@
 # A Practical Guide to Upgrading SGLang Omni's Backbone
 
-A Chinese version is available at [SGLang Omni 的 backbone 升级实操指南](./version_bump_guide_zh.md).
+For the Chinese version, see [SGLang Omni Backbone Version Upgrade Guide](./version_bump_guide_zh.md).
 
-SGLang Omni does not consume SGLang as a library; it consumes it as a framework. Roughly 68 of its ~512 Python files import internal modules from under `sglang.srt.*`, which upstream treats as implementation detail and changes without a deprecation cycle. Every backbone version bump is therefore a dependency update in form and a port across private interfaces in substance.
+SGLang Omni depends heavily on SGLang's internal APIs. Of its roughly 512 Python files, 68 directly import internal modules under `sglang.srt.*`. These modules are implementation details of SGLang, and their private interfaces come with no compatibility guarantees. A backbone version bump may look like a dependency update, but it also requires adapting the existing code to changes in those interfaces.
 
-> **Where the examples come from:** every example below is drawn from `0.5.16 → 0.5.17` ([PR #1477](https://github.com/sgl-project/sglang-omni/pull/1477)), which touched 10 files, adding 80 lines and removing 43. That is far smaller than the previous upgrade's 162 files, yet the two problems that took longest to resolve again sat in places a type checker cannot see. The full retrospective on the previous `0.5.12.post1 → 0.5.16` upgrade is [From API Alignment to Floating-Point Associativity](./version_bump.md); this guide does not repeat its case analysis.
+> All examples in this guide come from the `0.5.16 → 0.5.17` upgrade ([PR #1477](https://github.com/sgl-project/sglang-omni/pull/1477)). It touched 10 files, adding 80 lines and removing 43. That is far smaller than the previous upgrade, which touched 162 files, but a type checker still could not catch either of the two issues that took the most time. For a full retrospective on the earlier `0.5.12.post1 → 0.5.16` upgrade, see [From API Alignment to Floating-Point Associativity: Upgrading SGLang Omni's Backbone](./version_bump.md). This guide does not repeat those cases.
 
-## 1. How large the upgrade surface actually is
+## 1. The actual scope
 
-The heaviest dependencies are on `layers`, `managers` (where the scheduler lives), and `model_executor`:
+The three subsystems with the most import sites are `layers`, `managers` (where the scheduler lives), and `model_executor`:
 
-| Subsystem | Import sites |
+| Subsystem | Imports |
 |---|---:|
 | `sglang.srt.layers` | 69 |
 | `sglang.srt.managers` | 68 |
@@ -23,52 +23,50 @@ The heaviest dependencies are on `layers`, `managers` (where the scheduler lives
 | `sglang.srt.distributed` | 11 |
 | everything else (`platforms`, `configs`, `mem_cache`, `compilation`, `runtime_context`, `speculative`, `multimodal`, `environ`, `dllm`, `disaggregation`, `arg_groups`, `kernels`) | ~50 |
 
-The counts cover the `sglang_omni/` and `sglang_omni_router/` packages. Apart from `sglang.kernels`, all of it sits under `sglang.srt.*`, so none of these APIs should be assumed stable.
+These counts cover the `sglang_omni/` and `sglang_omni_router/` packages. Apart from `sglang.kernels`, every import path is under `sglang.srt.*`, so none of these APIs should be expected to remain stable.
 
-Recount this table at the start of every upgrade; the surface grows with feature work and the previous conclusion does not carry over. Its direct use is to bound the review: upstream organizes its release notes around its own module layout, and this table decides which of those entries can reach Omni. Step 1 uses it as the filter.
+Recount them at the start of every upgrade. As features are added, Omni's dependency on SGLang internals will keep growing, so the result from the previous upgrade cannot simply be reused. The distribution also helps identify which upstream changes may affect Omni and, in turn, which entries need attention in Step 1.
 
-`sglang_omni/vendor/sglang/` is the designated home for version-conditional code. Anything that has to branch on the SGLang version belongs there rather than scattered across call sites. That layer can fail too — see [section 5](#5-checking-that-an-interface-exists-is-not-checking-that-it-still-works).
+`sglang_omni/vendor/sglang/` is where version compatibility code belongs. Any logic that selects a different implementation based on the SGLang version should be kept there rather than scattered elsewhere. The compatibility layer can itself break; see [Section 5](#5-do-not-infer-the-version-from-interface-existence-alone).
 
-## 2. Two classes of failure, and what they imply for the process
+## 2. Two classes of change and what they mean for the process
 
-**Class A: the symbol changed.** Removed, renamed, or a changed signature. These always raise: `ImportError`, `TypeError: unexpected keyword argument`, `TypeError: missing required argument`. A type checker finds all of them before any code runs.
+Class A: a name is removed or renamed, or a function signature changes. These issues always raise an exception: `ImportError`, `TypeError: unexpected keyword argument`, or `TypeError: missing required argument`. A type checker can catch them before the code runs.
 
-**Class B: the symbol survived, its meaning changed.** The call still resolves, still accepts the same arguments, still returns normally, and no longer produces the original effect. Nothing raises, static tooling cannot observe it, and only real requests against a real model expose it.
+Class B: names and function signatures stay the same, but their semantics change. The call still resolves, accepts the same arguments, and returns normally, but no longer has its original effect. These issues raise no exception and static tools cannot find them. They surface only when real requests are run through a real model.
 
-The two classes differ by an order of magnitude in cost, which sets the ordering for everything below: **run static scanning as early as possible because it is cheap, and estimate the schedule from Class B because that is what dominates it.**
+The two classes differ by an order of magnitude in cost, and the work should be ordered accordingly. Static scans are cheap, so run them early. When estimating the schedule, plan around Class B, because that is where most of the time goes.
 
-> **0.5.17 example:** the split was 6 Class A and 2 Class B. The six Class A fixes were done in half a day; the two Class B ones consumed the rest.
+> In `0.5.17`, there were 6 Class A changes and 2 Class B changes. The 6 Class A changes were fixed within half a day; the 2 Class B changes took the rest of the time.
 >
-> The representative Class B case was the config split. `0.5.17` turned `ServerArgs` into a read-only startup record and moved resolved config onto a set of per-domain namespace objects that the SGLang source calls config bags (class `_ConfigBag`), read through accessors such as `get_exec()` and `get_parallel()`. The signature of `ServerArgs.override()` did not change at all and the call still returned normally, but it no longer wrote through to the config bag. Meanwhile `get_num_allocatable_reqs` moved its read from `get_server_args().pp_max_micro_batch_size` to `get_parallel().pp_max_micro_batch_size`. The result: the write reported success, the reader took its value from somewhere else, the scheduler read `None`, and the process died on `None - int` while handling the first batch.
+> One example in detail: `0.5.17` turned `ServerArgs` into a read-only startup record and moved the resolved configuration into a set of objects. The SGLang source calls these objects config bags (class `_ConfigBag`), and callers use functions such as `get_exec()` and `get_parallel()` to read the corresponding settings. The signature of `ServerArgs.override()` did not change, and the call still returned normally, but its changes were no longer propagated to the relevant config bag. At the same time, `get_num_allocatable_reqs` now had to read `get_parallel().pp_max_micro_batch_size` instead of `get_server_args().pp_max_micro_batch_size`. The write therefore returned normally but had no effect. The scheduler read `None` and stopped on the first batch when it tried to evaluate `None - int`.
 >
-> The previous retrospective concluded that "Omni depends on SGLang's concrete behavior, and the interface never pinned that behavior down." This is the extreme form of that: the interface did not change by a single character, only its behavior did.
+> The conclusion from the previous retrospective was that "Omni depends on SGLang's concrete behavior, and the interface never pinned that behavior down." This upgrade presented an even subtler problem: the interface did not change at all, but its behavior did.
 
 ## 3. Order of work
 
-### Step 0: diff the dependency metadata and decide whether an image rebuild needs to be queued now
+### Step 0: compare dependency metadata and decide whether the image needs to be rebuilt
 
-This takes about ten minutes, depends on no adaptation work, and determines the shape of the whole schedule.
+This takes about ten minutes and does not depend on any later adaptation work, but it affects the schedule for the entire upgrade.
 
 ```bash
-pip download --no-deps sglang==<old> -d /tmp/sgl-old
-pip download --no-deps sglang==<new> -d /tmp/sgl-new
+pip download --no-deps sglang==<old-version> -d /tmp/sgl-old
+pip download --no-deps sglang==<new-version> -d /tmp/sgl-new
 # unpack both, then compare METADATA / requires_dist
 ```
 
-Pay particular attention to flashinfer and torch. `.github/scripts/validate_omni_env_reusable.sh` requires both to resolve to the image's site-packages rather than the venv, so that the JIT cache baked into the image stays valid. If the new sglang's transitive dependencies demand a higher flashinfer, installing the project puts a second copy inside the venv and that check fails immediately. The requirement comes from the `sglang` package itself, is unrelated to what `pyproject.toml` says, and **cannot be fixed inside the PR**. What it needs is:
+Pay particular attention to flashinfer and torch. `.github/scripts/validate_omni_env_reusable.sh` requires them to be loaded from the image's site-packages, not from the venv, so that the prebuilt JIT cache in the image can be reused. If the new `sglang` requires a newer flashinfer version—possibly just as a result of dependency resolution—installing the project puts that newer version in the venv, and the check fails. The version requirement comes from the `sglang` package itself, not from `pyproject.toml`, and cannot be fixed in the PR. This requires both of the following:
 
-1. A rebuilt CI image. `docker/Dockerfile` pins the flashinfer version and `COPY`s `/root/.cache/flashinfer/<version>`.
-2. A digest update, across six workflow files plus the Dockerfile.
+1. Rebuild the CI image. `docker/Dockerfile` pins the flashinfer version and `COPY`s `/root/.cache/flashinfer/<version>`.
+2. Update the digest in six workflow files and the Dockerfile.
 
-`/docker` and `.github` both have CODEOWNERS, so the rebuild is work that queues behind someone else. **Raise the request on day 0 rather than waiting for the adaptation to finish.** Three reasons:
+Both `/docker` and `.github` have CODEOWNERS, so an image rebuild has to wait for the relevant owners to arrange it.
 
-- What goes into the image is determined entirely by the target SGLang version — the base image, the flashinfer version, and the JIT cache version — all known before the first line of adaptation code is written. Nothing discovered during adaptation changes the image's contents, so deferring the request yields no information.
-- Local upgrade and validation do not depend on the image. The image exists to satisfy the CI environment-reuse check and to allow JIT cache reuse; it has nothing to do with whether the code runs. Locally, installing the new sglang and letting it pull its own dependencies is enough.
-- Local adaptation and the image rebuild therefore sit on different critical paths and should run in parallel. Scheduling the rebuild after the adaptation simply adds queue time you do not control on top of the timeline.
+- The target SGLang version directly determines the base image, the flashinfer version, and the JIT cache version. All three are known before adaptation work starts, and nothing found during adaptation will change the image contents.
+- Local adaptation and validation do not depend on the image. The rebuild is needed for CI's environment-reuse check and for JIT cache reuse; it does not affect whether the code can run locally. Install the new `sglang` and its dependencies for local work.
+- Local adaptation and the image rebuild are on separate critical paths and should proceed in parallel. Waiting until adaptation is complete adds an unpredictable delay to the overall schedule.
 
-The only risk of asking early is that the adaptation turns out to be unworkable and the rebuild becomes unnecessary. Handle that by agreeing on a cancellation deadline when you file the request, not by deferring it. If some CI jobs cannot be reproduced locally because of GPU count, the rebuild is directly on the critical path and should be requested even sooner.
-
-> **0.5.17 example:** the diff came out as follows.
+> For `0.5.17`, the metadata diff was:
 >
 > | Requirement | 0.5.16 | 0.5.17 |
 > |---|---|---|
@@ -78,17 +76,17 @@ The only risk of asking early is that the adaptation turns out to be unworkable 
 > | `av` on Linux ARM | unpinned | `==16.1.0` |
 > | `xxhash` | absent | added |
 >
-> The flashinfer entry blocked CI outright, failing with `flashinfer must come from the image, not /data/omni-ci/pr-1477/omni` and `Torch and FlashInfer must use the image installation for JIT cache reuse`. The digest update covered 22 occurrences. The rebuild request was only raised on day four, and CI had been failing since its very first run.
+> The flashinfer version change made CI fail outright with `flashinfer must come from the image, not /data/omni-ci/pr-1477/omni` and `Torch and FlashInfer must use the image installation for JIT cache reuse`. Updating the digest required 22 changes. The image rebuild was not requested until the fourth day of the upgrade, and CI had been failing since its first run.
 
-### Step 1: read the changelog, and establish what it does not cover
+### Step 1: read the changelog and identify the scope of the changes
 
-Read **Breaking Changes** and **Dependencies** first; together they bound the architectural work.
+Start with the Breaking Changes and Dependencies sections to estimate the amount of architectural work involved.
 
-Then calibrate. A changelog documents the public product, so drift in private interface signatures falls outside its scope by construction — and most of what Omni depends on is private. Depth varies as well: even for entries that are covered, a changelog usually gives the conclusion rather than the failure mode. Its role is to point you at where to look, not to enumerate what breaks.
+Be clear about the changelog's limits. It usually does not record every change to private interface signatures, and most of what Omni uses is private. Even when a change is listed, the changelog often says what changed without explaining exactly how the old code will fail. It can point the investigation in the right direction, but it cannot replace checking each item.
 
-So add a mechanical comparison: unpack both wheels and diff only the modules the project actually imports.
+It is still best to compare the code directly: unpack the old and new wheels, then diff only the modules the project actually imports.
 
-> **0.5.17 example:** the changelog ran to 600-plus entries across 20-plus categories, and covered 2 of the 8 changes this upgrade required.
+> The `0.5.17` changelog contained more than 600 entries in over 20 categories, but covered only 2 of the 8 changes required for this upgrade.
 >
 > | Change | Covered by the changelog |
 > |---|---|
@@ -98,47 +96,47 @@ So add a mechanical comparison: unpack both wheels and diff only the modules the
 > | `SchedulerLogprobResultProcessor` dropped `server_args` | no |
 > | `SchedulerDPAttnAdapter` gained a required `model_runner` | no |
 > | `SchedulerLoadInquirer` gained three required telemetry accessors | no |
-> | `pp_max_micro_batch_size` read relocated to `get_parallel()` | no |
+> | `pp_max_micro_batch_size` read moved to `get_parallel()` | no |
 > | token clamp reads `dcp_size` | no |
 >
-> The note for the config split read "Code that mutated ServerArgs at runtime must route through the new accessors." That is entirely accurate, and it still does not say that the old call keeps returning successfully — which is the actual failure mode.
+> On the config split, the changelog said, "Code that mutated ServerArgs at runtime must route through the new accessors." That statement is accurate, but it does not say that the old call still returns normally. That omission is what led to the problem.
 
-### Step 2: establish a performance baseline, with warmup on every measurement
+### Step 2: establish a performance baseline
 
-Collect the baseline on the same machine, by the same method, for both versions, with warmup and repeats on every measurement. The core constraint: **the first execution of any code path on either version is not a valid measurement.**
+Collect the baseline for both versions on the same machine and with the same method. Warm up before every measurement and repeat each run. The main rule is that the first execution of any code path is not a valid measurement, because there are many reasons a code path may not be fully warmed up.
 
-Run `.github/scripts/delete_gpu_process.sh` between runs, as the CI workflows do. GPU memory still held by a previous run is the second-largest source of phantom regressions, after an unwarmed cache.
+Run `.github/scripts/delete_gpu_process.sh` between runs, just as the CI workflows do. GPU memory left over from the previous run is the second biggest source of false regressions, after an unwarmed cache.
 
-Each version must also run the dependency stack its own pin implies. What you are comparing is therefore two complete stacks, not two versions of one package, and the write-up has to say so.
+Both versions must also use the dependencies pinned for that version. A performance test compares two complete dependency stacks, not just two versions of one package.
 
-The measurement harness lives in `benchmarks/eval/`. The metrics CI asserts on are the same ones the PR description will need, so collect them in that shape from the start.
+The evaluation tools live in `benchmarks/eval/`. CI checks the same metrics that need to appear in the PR description, so collect them in the same form from the start.
 
-> **0.5.17 example:** four suspected performance regressions were investigated and none reproduced.
+> For `0.5.17`, four apparent performance regressions were investigated. All four were false alarms.
 >
 > | Observation | Actual cause |
 > |---|---|
-> | Qwen3-TTS throughput down | needed four runs to reach steady state |
-> | TTS stage-2 TTFC p95 at 0.5838 | fell back into the 0.506–0.529 baseline range on repeat |
-> | `ws_stream` latency p95 at 13.82s, over threshold | within threshold on both repeats |
-> | MMMU 0.959 qps, 16.05s latency | unwarmed inductor cache; passed three consecutive clean runs |
+> | Qwen3-TTS throughput dropped | it took four runs to reach steady state |
+> | TTS stage-2 TTFC p95 was 0.5838 | repeat runs returned to the 0.506–0.529 baseline range |
+> | `ws_stream` latency p95 was 13.82s, above the threshold | both repeat runs were within the threshold |
+> | MMMU at 0.959 qps and 16.05s latency | the inductor cache was not warm; three consecutive runs passed after cleanup |
 >
-> The two stacks were: `0.5.16` with flashinfer 0.6.14, helion 0.2.6, sgl-deep-gemm 0.1.4.post1; `0.5.17` with 0.6.15.post1, 1.4, 0.1.5.post1.
+> The dependency sets were flashinfer 0.6.14, helion 0.2.6, and sgl-deep-gemm 0.1.4.post1 for `0.5.16`; and 0.6.15.post1, 1.4, and 0.1.5.post1 for `0.5.17`.
 
-### Step 3: update the pin and run a static scan
+### Step 3: update the pin and run static checks
 
-Install the new version and let a type checker validate the existing call sites against the new internals. Class A failures can all be fixed here, at very low cost.
+After installing the new version, run a type checker against the existing code and the new internals. Class A changes can be fixed together at this stage, at low cost.
 
-The project does not configure a type checker, but running one ad hoc is still worth it. On this codebase `pyrefly` had a markedly better signal-to-noise ratio than `ty`, which produced enough noise to bury the useful diagnostics.
+The project does not currently configure a type checker, but running mypy or using an LSP with type checking can still find problems quickly, even though each tool produces a different amount of noise. In my experience, `pyrefly` has a much better signal-to-noise ratio than `ty`, and both are considerably faster than the more widely used `pyright`. `ty`, however, produces enough noise to bury useful diagnostics.
 
-**`try/except ImportError` hides import failures.** Such branches fall back to an alternative implementation when the import fails, so the model silently switches to a slower path — no exception, no log, just degraded performance with no diagnostic trail. Retired import paths must therefore be located statically, including references inside `try/except ImportError`, rather than waiting for runtime to surface them.
+**`try/except ImportError` hides import failures.** When an import fails, these branches fall back to another implementation, and the program silently switches to a slower path. There is no exception or log, only a performance drop with no diagnostic clue. Retired import paths should therefore be found with a static search, including references inside `try/except ImportError`, rather than left for runtime testing to uncover.
 
-> **Tip:** grep can find them, but it also matches comments and strings, and it cannot express the structural relation "the import is nested inside a `try` that catches `ImportError`". ast-grep matches on the syntax tree and handles both. To find real imports of a specific retired module:
+> **Tip:** grep can find matching text, but it also matches comments and strings, and it cannot tell that an import is inside a `try` block that catches `ImportError`. ast-grep matches the syntax tree and avoids both problems. To find imports from a known retired module:
 >
 > ```bash
 > ast-grep --lang python --pattern 'from sglang.jit_kernel.$$$A import $$$B'
 > ```
 >
-> To survey every import guarded by `ImportError`, producing a list to confirm one by one before the upgrade (17 matches under `sglang_omni/` at the time of writing):
+> To list all imports inside `try/except ImportError` blocks for review before the upgrade (there were 17 under `sglang_omni/` at the time of writing):
 >
 > ```bash
 > ast-grep --lang python --pattern 'try:
@@ -147,11 +145,11 @@ The project does not configure a type checker, but running one ad hoc is still w
 >     $$$H' sglang_omni/
 > ```
 >
-> This form covers both `from X import Y` and `import X`, and excludes `try` blocks that catch other exceptions. For each hit, confirm two things: whether the import still holds on the new version, and if not, whether its fallback is still the intended behavior.
+> This covers both `from X import Y` and `import X`, while excluding `try` blocks that catch other exceptions. Check two things for every match: whether the import still succeeds with the new version, and, if it does not, whether the fallback still behaves as intended.
 
-Committing each fix separately, with the reason in the commit subject, is recommended. It gives the PR description ready-made material and keeps the Class A fixes separable from the Class B ones that follow.
+It is also a good idea to commit each fix separately and explain the reason in the commit subject. This prepares material for the PR description and keeps the Class A fixes separate from the Class B fixes that follow.
 
-> **0.5.17 example:** this step produced three commits.
+> For `0.5.17`, this step produced three commits:
 >
 > ```
 > fix(qwen3-omni): drop the SamplingBatchInfo grammar-mask kwargs
@@ -159,63 +157,63 @@ Committing each fix separately, with the reason in the commit subject, is recomm
 > fix(scheduler): adapt to the 0.5.17 scheduler-component contracts
 > ```
 >
-> The second corresponds to the `try/except ImportError` case above: the MOSS-TTS-Local vocoder falls back to SDPA in that handler, and `sglang.jit_kernel` was retired in `0.5.17`, so the import necessarily fails.
+> The second commit is the `try/except ImportError` case described above. The MOSS-TTS-Local vocoder falls back to SDPA in that exception handler. Since `sglang.jit_kernel` was retired in `0.5.17`, the import always fails.
 
-### Step 4: bring up every model CI covers
+### Step 4: start every model covered by CI
 
-The CI model matrix is the must-run list; it is the project's enforced definition of what "supported" means.
+The CI model matrix is the list of required tests and defines the scope the project actually commits to supporting.
 
 | Workflow | Models | Checks |
 |---|---|---|
 | `test-asr-ci.yaml` | MOSS-Transcribe-Diarize; Fun-ASR or Qwen3-ASR (selectable) | WER, RTF, throughput |
-| `test-tts-ci.yaml` | Higgs or MOSS-TTS-Local (selectable), 5 stages | WER, SIM, TTFC, latency, streaming consistency, router DP2 stress |
+| `test-tts-ci.yaml` | Higgs or MOSS-TTS-Local (selectable), 5 stages | WER, SIM, TTFC, latency, streaming consistency, router DP2 stress test |
 | `test-qwen3-omni-ci.yaml` | Qwen3-Omni, 11 stages | thinker length, TTS WER and SIM, MMMU and MMSU accuracy and speed, talker, video |
 | `omni-ci.yaml` → PR Test | — | full unit test suite |
 
-Passing the static scan is not evidence that things run; Class B failures normally surface only here.
+Passing the static checks does not mean the code will run. Class B changes usually surface only at this stage.
 
-When switching back and forth between two versions, a common technique is to unpack the other sglang build into a directory and put that directory ahead of `sys.path` via `PYTHONPATH`, so `import sglang` resolves to it instead of the installed copy. This is usually just called a shadow. Its appeal is that switching costs one environment variable instead of reinstalling the whole stack.
+When switching repeatedly between two versions, a common approach is to unpack the other `sglang` version into a separate directory, then use `PYTHONPATH` to put that directory first on `sys.path`. This makes `import sglang` load that copy instead of the installed one. This is usually called a shadow. Switching then requires changing one environment variable rather than reinstalling the full dependency stack.
 
-A shadow has two limits. First, it replaces only sglang itself; the rest of the dependencies remain whatever is installed, so what you get is a hybrid stack matching neither side completely. That makes it suitable for quickly checking whether the code runs, but not for producing the comparison numbers Step 2 calls for, which have to be collected under each side's complete stack.
+A shadow has two limitations. First, it replaces only `sglang`; all other dependencies still come from the current environment, so the resulting stack matches neither the old version nor the new one exactly. It is useful for a quick check that the code runs, but not for collecting the comparison data from Step 2. That data must be collected with each version's complete dependency stack.
 
-**Second, a shadow only takes effect when the worker inherits the parent process environment.** CI tests start workers through `start_server_from_cmd` (`benchmarks/benchmarker/utils.py`), which builds from `os.environ.copy()` and then applies the caller's `env` over it. Tests that pass no `PYTHONPATH` inherit the shadow; tests that pin `PYTHONPATH` in their `process_env` override it, and the worker runs the installed version instead. In the latter case both sides run the same code, and the run will produce a false "no regression" conclusion.
+Second, a shadow works only if the worker inherits the parent process's environment. CI tests start workers through `start_server_from_cmd` (`benchmarks/benchmarker/utils.py`). It first copies `os.environ`, then applies the `env` supplied by the caller. A test that does not pass `PYTHONPATH` keeps the parent's shadow setting. If a test sets `PYTHONPATH` in `process_env`, that value overrides the shadow and the worker runs the installed version. The two test runs then use the same code and incorrectly report no regression.
 
-Before starting a comparison, confirm which category each test falls into by following the fixture down to the `process_env` argument passed to `launch_managed_router`. Tests in the second category must be run against a real installation of each version. As of current main, `test_tts_serving_ci.py` is in that category: it pins `PYTHONPATH` to the project root in `process_env` (`tests/test_model/test_tts_serving_ci.py:296`), and its benchmark subprocess does the same (`:369` in the same file).
+Before comparing versions, find the `process_env` passed to `launch_managed_router` and check which category each test falls into. Tests in the second category must be run after installing each version in turn. As of the current main branch, `test_tts_serving_ci.py` is in this category: it sets `PYTHONPATH` to the project root in `process_env` (`tests/test_model/test_tts_serving_ci.py:296`), and its benchmark subprocess does the same (`:369` in the same file).
 
-Record test coverage honestly, so that a table of passing results does not imply complete coverage.
+Record exactly which tests were run. A table of passing results should not imply that the full matrix was covered.
 
-> **0.5.17 example:** both Class B failures surfaced only at this step, and produced the two most time-consuming commits.
+> Both Class B changes in `0.5.17` surfaced at this stage. The corresponding fixes were also the two most time-consuming commits:
 >
 > ```
 > fix(scheduler): route the pp_max_micro_batch_size default through the context
 > fix(scheduler): mirror the 0.5.17 step counters and batch launch timestamp
 > ```
 >
-> On coverage, 12 of the 17 GPU tests were run; TTS stages 3–5 and the four Qwen3-Omni video jobs were not, and the PR says so.
+> In this upgrade, 12 of the 17 GPU tests were run. TTS stages 3–5 and the four Qwen3-Omni video jobs were not run, and the PR states that explicitly.
 
-### Step 5: when chasing a regression, reproduce before you localize
+### Step 5: reproduce a regression before investigating its cause
 
-The Step 2 constraint applies here as well: **no slowdown counts as a regression until it reproduces on a clean GPU.** Reproduction costs minutes and root-causing costs days, so the order should not be inverted.
+The rule from Step 2 applies here as well: a performance drop must not be treated as a regression until it has been reproduced in a clean environment. Reproduction usually takes minutes; finding the root cause may take days. Reproduce first, then investigate.
 
-Once a regression is confirmed, one useful move is to add temporary logging to the compatibility layer on a running server, recording what each call site actually reads and writes at the moment it is called. Compared with reviewing call sites statically, this gives you real behavior rather than inference.
+Once a regression is confirmed, add temporary logging to the compatibility layer on a running server to record the values each call site actually reads and writes. Unlike static inspection, these logs show actual runtime behavior rather than an inference.
 
-But it only covers the call sites that run actually reaches; the rest remain unknown. **Keep conclusions inside what was measured**, and state explicitly what was not covered. Overstating the blast radius sends the next reader down the wrong path.
+These logs cover only the call sites exercised by that run; the rest remain unknown. Base conclusions on measured results, and state clearly which paths were not covered. Overstating the scope will mislead later investigation.
 
-> **0.5.17 example:** the repository had 23 `override_server_args` call sites across 13 fields. After adding temporary logging to that helper on a running Qwen3-TTS server, three of them yielded definite conclusions and none of the three was affected; the one that actually broke was `pp_max_micro_batch_size`. The remaining call sites belong to model paths that run did not exercise, and the PR marks them explicitly as unaudited.
+> Across the repository, there were 23 `override_server_args` call sites covering 13 fields. Temporary logging was added to the helper on a running Qwen3-TTS server. The three call sites reached by that run all yielded clear results, and none was affected; only `pp_max_micro_batch_size` was actually broken. The remaining callers were on model paths not reached by the run, and the PR marks them as unaudited.
 >
-> The formulation finally used was: writing through `ServerArgs.override` and later reading it back off `ServerArgs` still works; writing and then expecting a config bag reader to observe the value does not. That can be acted on directly, whereas "these overrides have all stopped working" cannot.
+> Based on those measurements, the PR reached a narrow conclusion: writing through `ServerArgs.override` and later reading the value back from `ServerArgs` still works, but writing a value for a config bag consumer to read does not. It would be wrong to summarize this as "all of these overrides are broken."
 
-### Step 6: open the PR once pre-commit and the full unit test suite pass
+### Step 6: open the PR after pre-commit and all unit tests pass
 
-`pre-commit` runs autoflake, isort, black, and ruff locally, and the `lint` job runs the same set, so a clean local run predicts a green lint job.
+`pre-commit` runs autoflake, isort, black, and ruff locally. The `lint` job in CI runs the same checks.
 
-The fake objects that stand in for SGLang components in unit tests (`tests/unit_test/fakes.py`) hard-code the shape of upstream's interfaces: when upstream's new code reads one more field, those fakes have to carry it, or the tests either fail outright or keep passing while no longer matching real behavior. The second outcome is the dangerous one. Updating them is therefore part of the port, not a cleanup afterwards.
+The fake objects used in place of SGLang components in unit tests (`tests/unit_test/fakes.py`) hard-code the structure of upstream interfaces. Whenever upstream code reads another field, that field must be added to the fakes. Otherwise the tests either fail outright or keep passing even though they no longer reflect real behavior; the latter is more dangerous. Updating the fakes is part of the adaptation work, not final cleanup.
 
-**Before attributing any failure to the upgrade, verify whether it reproduces on the old pin.** Verification usually takes a single command, while a wrong attribution costs hours of investigation.
+Before attributing any failure to the upgrade, check whether it reproduces on the old version. That check usually takes one command, while a wrong attribution can waste hours of investigation.
 
-The PR description should carry the version diff table, a one-line rationale per adapted call site, the accuracy and performance comparison, and an explicit statement of what was not run.
+The PR description must include a version-difference table, a one-line explanation of each adaptation, accuracy and performance comparisons, and a clear list of anything that was not run.
 
-> **0.5.17 example:** 3 of the 9 substantive commits touched only tests.
+> For `0.5.17`, 3 of the 9 substantive commits changed only tests:
 >
 > ```
 > test(scheduler): give the scheduler doubles a dcp_size-bearing server_args
@@ -223,60 +221,46 @@ The PR description should carry the version diff table, a one-line rationale per
 > test: adapt two merged-in suites to the 0.5.17 contract
 > ```
 >
-> The one failing unit test, `test_mp_runner_startup_failure_includes_child_factory_traceback`, reproduced identically on `0.5.16`: the test allows 10s for startup, while a cold `import sglang_omni.pipeline.stage_workers` takes 18.6s on that machine. That is a property of the machine, not a regression.
+> The only failing unit test, `test_mp_runner_startup_failure_includes_child_factory_traceback`, failed in exactly the same way on `0.5.16`: the test allowed 10 seconds for startup, while a cold `import sglang_omni.pipeline.stage_workers` took 18.6 seconds on that machine. The failure was due to that machine's performance, not the version upgrade.
 
-## 4. Keeping up with a moving main branch
+## 4. Dealing with a main branch that keeps moving
 
-The upgrade happens on a main branch that keeps moving, and the adaptation surface grows while you validate. Two consequences follow. First, **keep the upgrade PR minimal in scope**, with no incidental refactoring, to contain the conflict surface. Second, **land it quickly**, because the cost of maintaining the branch rises the longer it lives.
+The main branch continues to change during an upgrade, and the scope of the adaptation may grow with it. Two principles help. First, keep the upgrade PR small—make minimal changes and do not include unrelated refactoring—to reduce conflicts. Second, merge it as soon as possible, because the longer the branch remains open, the more it costs to maintain. The exact timing still depends on the project's overall roadmap.
 
-After every merge from main, run these grep checks item by item:
+After every merge from main, check again for performance regressions and for new instances of the same compatibility problems.
 
-```bash
-# retired module paths
-git grep -n "sglang\.jit_kernel"
+> During the `0.5.17` upgrade, changes from main were merged into the upgrade branch three times in four days. One commit existed only to re-adapt tests brought in by a merge. While CI was blocked, two more relevant changes landed on main: `models/moss_tts/vocoder_decoder.py` was merged into `audio_tokenizer.py`, deleting the original file modified by the PR and moving its `jit_kernel` import with it; and a deterministic-inference feature added two new `override_server_args` call sites.
 
-# call sites whose contract has relocated
-git grep -n "override_server_args\|get_global_server_args"
-git grep -n "SamplingBatchInfo("
+## 5. Do not infer the version from interface existence alone
 
-# anything reaching into the config split
-git grep -n "sglang\.srt\.server_args\|sglang\.srt\.runtime_context"
-```
-
-New code merged from main was written against the old pin and will reintroduce patterns you have already corrected.
-
-> **0.5.17 example:** the upgrade branch merged from main three times in four days, with one commit devoted purely to re-adapting tests that arrived with a merge. While CI was blocked, main changed twice more: it deleted a file the PR had modified — `models/moss_tts/vocoder_decoder.py` was folded into `audio_tokenizer.py`, taking its `jit_kernel` import along — and it added two new `override_server_args` call sites in a deterministic-inference feature.
-
-## 5. Checking that an interface exists is not checking that it still works
-
-`override_server_args` in `sglang_omni/vendor/sglang/server_args.py` exists precisely to hold the version boundary in one place. It dispatches like this:
+`override_server_args` in `sglang_omni/vendor/sglang/server_args.py` is intended to keep the handling for different versions in one place. It selects an implementation as follows:
 
 ```python
 legacy_override = getattr(server_args, "override", None)
 if callable(legacy_override):
     legacy_override(source, **fields)
     return
-# newer-version paths: get_context().override(...) / declare_late_resolution(...)
+# get_context().override(...) / declare_late_resolution(...)
 ```
 
-`ServerArgs.override` still exists on `0.5.17`, so the shim always enters the first branch and the two paths prepared for newer versions below it are unreachable. In the end the scheduler bypassed the shim and called `get_context().override(...)` directly.
+`ServerArgs.override` still exists in `0.5.17`, so this code always enters the first branch. The two paths below it for the new version never run. The temporary fix was for the scheduler to bypass this code and call `get_context().override(...)` directly.
 
-The general conclusion: **when upstream deprecates an API by keeping the interface and removing its effect, deciding the version from "does the symbol exist" silently selects the unreachable path.** The dispatch condition should be the version number, or an observable effect — write a value, then read it back through the accessor consumers actually use — rather than whether the method is still there.
+More generally, when upstream deprecates an API by leaving the interface in place but removing its effect, checking only whether the function exists silently selects the broken legacy branch and prevents the new-version path from running. Use the version number instead, or check an observable result: write a value, then read it back through the accessor that the consumer actually uses. The presence of the method alone is not enough.
 
-As of current main this shim is still unfixed: PR #1477 worked around it by calling `get_context().override(...)` directly in `omni_scheduler.py`, and left the shim's own dispatch condition untouched. The fix itself is one-off and belongs inside the shim, where a single change covers every call site.
+As of the current main branch, this small issue is still not fixed. PR #1477 only worked around it by calling `get_context().override(...)` directly in `omni_scheduler.py`; it did not change the shim itself. The fix belongs in the shim.
 
-But fixing it only settles this one case. No patch prevents upstream from deprecating another interface the same way next time, and changes of that kind raise no exception and are invisible to static tooling — they are Class B, and only the real runs in Step 4 will expose them.
+That would solve only this case. It cannot stop upstream from deprecating another interface in the same way. Such a change raises no exception and cannot be found by static tools. It is a Class B change, and it surfaces only when real models are run in Step 4.
 
 ## 6. Checklist
 
-- [ ] Dependency metadata diffed; if an image rebuild is needed, the request goes to CODEOWNERS on day 0
-- [ ] Changelog's Breaking Changes and Dependencies read; the private API surface diffed separately
-- [ ] Baseline collected on the target machine, with warmup and repeats
-- [ ] Pin updated; static scan clean (`pyrefly`)
-- [ ] Retired import paths checked statically, including references inside `try/except ImportError`
-- [ ] Every model CI covers starts up and serves correctly
-- [ ] Every suspected regression reproduced on a clean GPU before localization begins
-- [ ] Every failure verified on the old pin before attribution
-- [ ] Unit test fake objects updated to the new interfaces
-- [ ] `pre-commit` clean, full unit test suite passing
-- [ ] The PR states what was not run
+- [ ] Compare dependency metadata; if the image needs to be rebuilt, ask the CODEOWNERS for a rebuild on day 0
+- [ ] Read the Breaking Changes and Dependencies sections of the changelog; compare private APIs separately
+- [ ] Collect a baseline on the target machine, with warmup and repeated measurements
+- [ ] Update the pin and scan statically for type errors
+- [ ] Check retired import paths statically, including references inside `try/except ImportError`
+- [ ] Verify that every model covered by CI starts and serves requests successfully
+- [ ] Reproduce every suspected regression on a clean GPU before investigating its cause
+- [ ] Before attributing a failure to the upgrade, check whether it also reproduces on the old version
+- [ ] Update unit-test fakes to match the new interfaces
+- [ ] Pass `pre-commit` and the full unit test suite
+- [ ] State in the PR which tests were not run
